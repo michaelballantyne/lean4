@@ -311,28 +311,10 @@ syntax that was elaborated.
 
 ### 6.2 How the design handles this
 
-The design uses three mechanisms to bridge the gap between surface syntax and
-elaborated syntax:
+The design uses two mechanisms to bridge the gap between surface syntax and
+elaborated syntax for the purpose of reference collection:
 
-#### Mechanism 1: MacroExpansionInfo in the InfoTree
-
-When a macro is expanded, the elaborator records a `MacroExpansionInfo` node
-(`src/Lean/Elab/InfoTree/Types.lean:157`):
-
-```lean
-structure MacroExpansionInfo where
-  lctx   : LocalContext
-  stx    : Syntax      -- the original macro invocation
-  output : Syntax      -- the expanded result
-```
-
-This is pushed via `withMacroExpansionInfo` (`src/Lean/Elab/InfoTree/Main.lean:485`).
-The `MacroExpansionInfo` node becomes the parent of all info nodes produced by
-elaborating the expansion. This means the InfoTree records the full expansion
-chain: from original syntax through each macro expansion step to the final
-elaborated terms.
-
-#### Mechanism 2: Synthetic SourceInfo with position copying
+#### Mechanism 1: Synthetic SourceInfo with position copying
 
 When a macro constructs new syntax using quotations, the new syntax nodes get
 **synthetic** `SourceInfo` that copies the position from the original syntax.
@@ -355,7 +337,7 @@ The syntax quotation elaborator in `src/Lean/Elab/Quotation.lean` generates
 code that calls `SourceInfo.fromRef` with `canonical := true` for antiquotation
 splices.
 
-#### Mechanism 3: The `.original` filter in `findReferences`
+#### Mechanism 2: The `.original` filter in `findReferences`
 
 The reference collection function (`src/Lean/Server/References.lean:266`) has
 this critical filter:
@@ -423,6 +405,55 @@ to multiple internal identifiers:
 merged, and `FVarAliasInfo` nodes provide explicit alias information. When
 merging, it prefers `RefIdent.const` over `RefIdent.fvar` as the canonical
 representative, since constants are the globally-visible form.
+
+### 6.5 What about `MacroExpansionInfo`?
+
+When a macro is expanded, the elaborator records a `MacroExpansionInfo` node in
+the InfoTree (`src/Lean/Elab/InfoTree/Types.lean:157`):
+
+```lean
+structure MacroExpansionInfo where
+  lctx   : LocalContext
+  stx    : Syntax      -- the original macro invocation
+  output : Syntax      -- the expanded result
+```
+
+This node is pushed via `withMacroExpansionInfo`
+(`src/Lean/Elab/InfoTree/Main.lean:485`) and becomes the parent of all info
+nodes produced by elaborating the expansion. This means the InfoTree records
+the full expansion chain.
+
+However, `MacroExpansionInfo` is **not used by the "go to references" service
+at all**. The `identOf` function (`src/Lean/Server/References.lean:241`) only
+matches `Info.ofTermInfo`, `Info.ofFieldInfo`, `Info.ofOptionInfo`, and
+`Info.ofDocElabInfo`—it ignores `Info.ofMacroExpansionInfo` entirely. The
+`MacroExpansionInfo` nodes are simply traversed through by `visitM'` on the way
+to the child `TermInfo` nodes that carry the actual semantic data.
+
+`MacroExpansionInfo` is used by **other** parts of the system:
+
+- **Linters** (`src/Lean/Linter/Util.lean`): The `collectMacroExpansions?`
+  function walks up the InfoTree from a given range, collecting
+  `MacroExpansionInfo` nodes on the way. This is used by the unused variable
+  linter (`src/Lean/Linter/UnusedVariables.lean:542`) to understand whether a
+  seemingly-unused variable was introduced by macro expansion, and therefore
+  should not be flagged.
+
+- **Tactic state display** (`src/Lean/Server/InfoUtils.lean:485`): When
+  searching for nested tactics, the `hasNestedTactic` function descends through
+  `MacroExpansionInfo` nodes transparently, treating them as structurally
+  invisible wrappers.
+
+- **Go to definition via custom elaborators** (`tests/lean/interactive/goTo.lean:41`):
+  A custom term elaborator can call `withMacroExpansionInfo orig stx` to connect
+  its output syntax back to the original syntax. This allows "go to declaration"
+  on the macro invocation to navigate to the definition of the macro *syntax*
+  itself rather than to the expanded form—a different LSP operation from
+  "go to references."
+
+So `MacroExpansionInfo` serves the InfoTree as a general-purpose record of the
+expansion provenance, but the references system bypasses it entirely by relying
+on the `.original` SourceInfo filter instead.
 
 ## 7. Summary: the data flow end to end
 
